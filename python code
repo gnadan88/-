@@ -1,0 +1,203 @@
+# 1.필요한 라이브러리 호출 
+from machine import Pin
+from machine import I2C
+from pico_i2c_lcd import I2cLcd
+import time
+from machine import I2C, Pin
+from machine import UART, Pin
+
+relay = Pin(2, Pin.OUT)
+relay.value(0) #릴레이 온
+
+# 2.시리얼통신 객체 생성 
+BTserial = UART(0, baudrate = 9600, tx = Pin(16), rx = Pin(17))
+
+# 3.I2C객체 생성 
+sda = Pin(0)     # for data pin
+scl = Pin(1)     # for clock pin
+i2c = I2C(0, sda = sda, scl = scl)
+# 2-2 I2C ADC
+dev = I2C(1, freq=400000, scl=Pin(15), sda=Pin(14))
+devices = dev.scan()
+for device in devices: print(device)
+address = 72
+
+# 4.변수
+adc_ref=0
+adc_ref_sum=0
+adc_v=[]
+max_adc=0
+max_adc_of=0
+mode=0
+adc_sensor=0
+adc_sensor_sum=0
+cnt_1=0
+
+# 5.LCD 주소 읽어 오기 
+addressA = 0x27
+
+# LCD 객체 생성
+lcd = I2cLcd(i2c, addressA, 2, 16) # i2c 객체, lcd주소, 행의 수, 열의 수
+
+# LCD 제어(텍스트 출력)
+count = 1
+lcd.clear()        # LCD 화면 지우기
+
+#def val_to_voltage(val, max_val=26100, voltage_ref=3.3):65536//32768
+def val_to_voltage(val, max_val=32768, voltage_ref=5.0):
+    return val / max_val * voltage_ref
+
+def current_to_voltage(val1, max_val1=32768, voltage_ref1=5.0):
+    return val1 / max_val1 * voltage_ref1
+
+
+def read_config():
+    dev.writeto(address, bytearray([1]))
+    result = dev.readfrom(address, 2)
+    return result[0] << 8 | result[1]
+
+def read_value(channel):
+    config = read_config()
+    config &= ~(7 << 12) #clear MUX bits
+    config &= ~(7 << 9)  #clear PGA
+    config |= (7 & (4 + channel)) << 12
+    config |= (1 << 15)  # trigger next conversion.
+    config |= (1 << 9)   # gain 4.096volts
+    config = [int(config >> i & 0xff) for i in (8, 0)]
+    dev.writeto(address, bytearray([1] + config))
+    config = read_config()
+    while (config & 0x8000) == 0:
+        config = read_config()
+    dev.writeto(address, bytearray([0]))
+    result=dev.readfrom(address, 2)
+    return result[0] << 8 | result[0]
+
+while True:
+    
+    #시리얼통신 데이터 수신 
+    if BTserial.any() > 0:
+        data_b = BTserial.read() #바이트 문자열
+        data_n = data_b.decode('utf-8') #일반 문자열로 변경
+        if data_n=='a':
+            relay.value(0) #릴레이 온
+            mode=0		#수동 
+            
+        if data_n=='b':
+            relay.value(0) #릴레이 온
+            mode=1		#자동 
+            
+        if data_n=='c':
+            relay.value(0) #릴레이 온
+            
+        if data_n=='d':
+            relay.value(1)  #릴레이 오프       
+
+    #레퍼런스 adc 입력값  평균 10회 
+    for i in range(10):
+        val1 = read_value(1)
+        adc_ref_sum+=val1
+    adc_ref=adc_ref_sum//10
+    adc_ref_sum=0
+    
+    #레퍼런스 adc 센서 측정값 평균 10회
+    if cnt_1==0:
+        for i in range(10):
+            val = read_value(0)
+            adc_sensor_sum+=val
+        adc_sensor=adc_sensor_sum//10
+        adc_sensor_sum=0
+        cnt_1=1
+       
+    #max adc 값 추출 200회 반복 
+    max_adc=read_value(0)
+    for i in range(200):
+        adc_v.append(read_value(0))
+        if adc_v[i] > max_adc:
+            max_adc =adc_v[i]
+            
+    #옵셑값 추출     
+    offset= adc_sensor-adc_ref//2
+    
+    #(레퍼런스 전압의 1/2 값)과 (전류가 흐르지 않을 때의 Vout 전압) 의 전압차 만큼 뺌
+    max_adc_of=max_adc-offset
+    #adc_v=[] 리스트 지움 
+    adc_v.clear()
+    
+    #레퍼런스(입력)ADC(5V)의 1/2 값을 빼줌
+    AC_adc = max_adc_of-adc_ref//2
+    
+    if AC_adc<=0:
+        AC_adc=0
+    if AC_adc==257:
+        AC_adc=0
+        
+    current_ms_max = current_to_voltage(AC_adc)
+    watt=int(220*current_ms_max)
+    current_ms_max=int(current_ms_max*1000)  
+    
+    print("adc_ref:", adc_ref,"max_adc:", max_adc,"  AC_adc:", AC_adc, " current :", current_ms_max, " watt:",watt) 
+    
+    if mode==1:
+        if current_ms_max <= 30:
+            relay.value(1)  #릴레이 오프
+            mode=0
+            
+    
+    #LCD 표기위함 
+    current_data = "{}".format(current_ms_max)
+    current_len=len(current_data)
+    
+    watt_data = "{}".format(watt)
+    watt_len=len(watt_data)
+
+ 
+    lcd.move_to(0, 0)
+    lcd.putstr("Current:")
+    lcd.move_to(9, 0)
+    lcd.putstr(str(current_ms_max))
+    for i in range(4-current_len):
+        lcd.putstr(" ")
+    lcd.move_to(14, 0)
+    lcd.putstr("mA")
+    
+    lcd.move_to(0, 1)
+    lcd.putstr("Watt:")
+    lcd.move_to(6, 1)
+    lcd.putstr(str(watt))
+    for i in range(4-watt_len):
+        lcd.putstr(" ")
+    
+    lcd.move_to(11, 1)
+    lcd.putstr("W")
+    
+    #시리얼통신 데이터 송신
+    sensor_data ="{}".format(current_ms_max)
+    Wsensor_data ="{}".format(watt)
+      
+    if current_len==4:
+        BTserial.write(sensor_data.encode())
+    elif current_len==3:
+        BTserial.write("0")
+        BTserial.write(sensor_data.encode())
+    elif current_len==2:
+        BTserial.write("00")
+        BTserial.write(sensor_data.encode())
+    else:
+        BTserial.write("000")
+        BTserial.write(sensor_data.encode())
+        
+    if watt_len==3:
+        BTserial.write(Wsensor_data.encode())
+    elif watt_len==2:
+        BTserial.write("0")
+        BTserial.write(Wsensor_data.encode())
+    else:
+        BTserial.write("00")
+        BTserial.write(Wsensor_data.encode())
+          
+    time.sleep(0.5)	#PC시스템 내부 속도 조절 
+    BTserial.write("a")
+    max_adc=0
+    max_adc_of=0
+ 
+
